@@ -1,0 +1,141 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Scan & ingest findings
+    runs-on: ubuntu-latest
+
+    services:
+      juice-shop:
+        image: bkimminich/juice-shop:latest
+        ports:
+          - 3000:3000
+
+      db:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: sentinel
+          POSTGRES_DB: findings
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sentinel -d findings"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: findings
+      DB_USER: sentinel
+      DB_PASSWORD: sentinel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare results directory
+        run: mkdir -p results
+
+      - name: Wait for Juice Shop
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:3000/ >/dev/null; then
+              echo "Juice Shop is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Juice Shop did not become ready in time" >&2
+          exit 1
+
+      - name: Initialize database schema
+        run: |
+          docker run --rm --network host \
+            -v "$PWD/db/init.sql:/init.sql:ro" \
+            -e PGPASSWORD="${DB_PASSWORD}" \
+            postgres:16-alpine \
+            psql -h 127.0.0.1 -U "${DB_USER}" -d "${DB_NAME}" -f /init.sql
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Semgrep (SAST)
+        continue-on-error: true
+        run: |
+          pip install --quiet semgrep
+          git clone --depth 1 https://github.com/juice-shop/juice-shop.git /tmp/juice-shop
+          semgrep \
+            --config=p/owasp-top-ten \
+            --json \
+            --output=results/semgrep.json \
+            /tmp/juice-shop
+
+      - name: Run Trivy (container image)
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: bkimminich/juice-shop:latest
+          format: json
+          output: results/trivy-juice.json
+          exit-code: "0"
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
+      - name: Run ZAP baseline (DAST)
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "$PWD/results:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://127.0.0.1:3000 \
+              -J zap-juice.json \
+              -r zap-juice.html \
+              -I
+
+      - name: Ingest findings into Postgres
+        run: |
+          pip install --quiet psycopg2-binary
+          files=()
+          for f in results/semgrep.json results/trivy-juice.json results/zap-juice.json; do
+            if [[ -f "$f" ]]; then
+              files+=("$f")
+            else
+              echo "Skipping missing report: $f"
+            fi
+          done
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No scan reports found to ingest" >&2
+            exit 1
+          fi
+          python scripts/ingest_results.py "${files[@]}"
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results-${{ github.run_id }}
+          path: |
+            results/semgrep.json
+            results/trivy-juice.json
+            results/zap-juice.json
+            results/zap-juice.html
+          if-no-files-found: warn
+          retention-days: 14
