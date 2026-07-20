@@ -82,12 +82,14 @@ jobs:
         continue-on-error: true
         run: |
           pip install --quiet semgrep
+          # Scan this repo (demo_app + scripts). Also keep Juice Shop as a broader target.
           git clone --depth 1 https://github.com/juice-shop/juice-shop.git /tmp/juice-shop
           semgrep \
             --config=p/owasp-top-ten \
+            --config=p/python \
             --json \
             --output=results/semgrep.json \
-            /tmp/juice-shop
+            demo_app /tmp/juice-shop
 
       - name: Run Trivy (container image)
         uses: aquasecurity/trivy-action@v0.36.0
