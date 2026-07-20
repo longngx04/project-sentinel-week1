@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: read
+  security-events: write   # required to upload SARIF to GitHub Code Scanning
+  actions: read
 
 concurrency:
   group: security-scan-${{ github.ref }}
@@ -81,6 +83,7 @@ jobs:
       - name: Run Semgrep (SAST)
         continue-on-error: true
         run: |
+          # JSON for Postgres ingest; SARIF for GitHub Security / Code scanning
           docker run --rm \
             -v "$PWD/demo_app:/src:ro" \
             -v "$PWD/results:/out" \
@@ -92,12 +95,32 @@ jobs:
               --output=/out/semgrep.json \
               /src
 
-      - name: Run Trivy (container image)
+          docker run --rm \
+            -v "$PWD/demo_app:/src:ro" \
+            -v "$PWD/results:/out" \
+            semgrep/semgrep:latest \
+            semgrep \
+              --config=p/owasp-top-ten \
+              --config=p/python \
+              --sarif \
+              --output=/out/semgrep.sarif \
+              /src
+
+      - name: Run Trivy JSON (for DB ingest)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: bkimminich/juice-shop:latest
           format: json
           output: results/trivy.json
+          exit-code: "0"
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
+      - name: Run Trivy SARIF (for GitHub Security)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: bkimminich/juice-shop:latest
+          format: sarif
+          output: results/trivy.sarif
           exit-code: "0"
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
 
@@ -139,6 +162,20 @@ jobs:
             psql -h 127.0.0.1 -U "${DB_USER}" -d "${DB_NAME}" -c \
             "SELECT tool, severity, COUNT(*) AS n FROM scan_findings GROUP BY tool, severity ORDER BY tool, severity;"
 
+      - name: Upload Semgrep results to GitHub Security
+        if: always() && hashFiles('results/semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results/semgrep.sarif
+          category: semgrep
+
+      - name: Upload Trivy results to GitHub Security
+        if: always() && hashFiles('results/trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results/trivy.sarif
+          category: trivy
+
       - name: Upload scan artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -146,7 +183,9 @@ jobs:
           name: security-scan-results-${{ github.run_id }}
           path: |
             results/semgrep.json
+            results/semgrep.sarif
             results/trivy.json
+            results/trivy.sarif
             results/zap.json
             results/zap.html
           if-no-files-found: warn
