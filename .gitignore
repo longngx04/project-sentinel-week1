@@ -1,0 +1,10 @@
+results/*.json
+results/*.html
+results/*.xml
+!results/.gitkeep
+__pycache__/
+*.pyc
+.env
+.venv/
+*.egg-info/
+.semgrep/

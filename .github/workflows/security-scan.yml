@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   scan:
-    name: Scan & ingest findings
+    name: SAST / DAST / ingest
     runs-on: ubuntu-latest
 
     services:
@@ -81,22 +81,23 @@ jobs:
       - name: Run Semgrep (SAST)
         continue-on-error: true
         run: |
-          pip install --quiet semgrep
-          # Scan this repo (demo_app + scripts). Also keep Juice Shop as a broader target.
-          git clone --depth 1 https://github.com/juice-shop/juice-shop.git /tmp/juice-shop
-          semgrep \
-            --config=p/owasp-top-ten \
-            --config=p/python \
-            --json \
-            --output=results/semgrep.json \
-            demo_app /tmp/juice-shop
+          docker run --rm \
+            -v "$PWD/demo_app:/src:ro" \
+            -v "$PWD/results:/out" \
+            semgrep/semgrep:latest \
+            semgrep \
+              --config=p/owasp-top-ten \
+              --config=p/python \
+              --json \
+              --output=/out/semgrep.json \
+              /src
 
       - name: Run Trivy (container image)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: bkimminich/juice-shop:latest
           format: json
-          output: results/trivy-juice.json
+          output: results/trivy.json
           exit-code: "0"
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
 
@@ -108,15 +109,15 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py \
               -t http://127.0.0.1:3000 \
-              -J zap-juice.json \
-              -r zap-juice.html \
+              -J zap.json \
+              -r zap.html \
               -I
 
       - name: Ingest findings into Postgres
         run: |
           pip install --quiet psycopg2-binary
           files=()
-          for f in results/semgrep.json results/trivy-juice.json results/zap-juice.json; do
+          for f in results/semgrep.json results/trivy.json results/zap.json; do
             if [[ -f "$f" ]]; then
               files+=("$f")
             else
@@ -129,6 +130,15 @@ jobs:
           fi
           python scripts/ingest_results.py "${files[@]}"
 
+      - name: Summarize findings
+        if: always()
+        run: |
+          docker run --rm --network host \
+            -e PGPASSWORD="${DB_PASSWORD}" \
+            postgres:16-alpine \
+            psql -h 127.0.0.1 -U "${DB_USER}" -d "${DB_NAME}" -c \
+            "SELECT tool, severity, COUNT(*) AS n FROM scan_findings GROUP BY tool, severity ORDER BY tool, severity;"
+
       - name: Upload scan artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -136,8 +146,8 @@ jobs:
           name: security-scan-results-${{ github.run_id }}
           path: |
             results/semgrep.json
-            results/trivy-juice.json
-            results/zap-juice.json
-            results/zap-juice.html
+            results/trivy.json
+            results/zap.json
+            results/zap.html
           if-no-files-found: warn
           retention-days: 14

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Intentionally vulnerable demo app for testing the security scan workflow.
-DO NOT deploy or use in production.
+Intentionally vulnerable demo app for SAST testing.
+DO NOT deploy to production.
 """
 
 from __future__ import annotations
@@ -14,19 +14,18 @@ import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
-# Hardcoded credentials / secrets (Semgrep: secrets, hardcoded password)
+# Hardcoded secrets (detectable by Semgrep)
 DB_PASSWORD = "admin123"
 API_KEY = "sk-live-super-secret-key-do-not-share"
 AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 
 def weak_password_hash(password: str) -> str:
-    # Weak hashing: MD5 for passwords
     return hashlib.md5(password.encode()).hexdigest()
 
 
 def lookup_user(username: str) -> list:
-    # SQL injection: unsanitized string formatting
+    # SQL injection via string formatting
     conn = sqlite3.connect(":memory:")
     cur = conn.cursor()
     cur.execute("CREATE TABLE users (id INTEGER, username TEXT, role TEXT)")
@@ -39,9 +38,8 @@ def lookup_user(username: str) -> list:
 
 
 def run_ping(host: str) -> str:
-    # Command injection: shell=True with user input
-    output = subprocess.check_output(f"ping -c 1 {host}", shell=True, text=True)
-    return output
+    # Command injection
+    return subprocess.check_output(f"ping -c 1 {host}", shell=True, text=True)
 
 
 def load_session(blob: bytes):
@@ -50,15 +48,14 @@ def load_session(blob: bytes):
 
 
 def read_user_file(filename: str) -> str:
-    # Path traversal: joins user input onto a base directory without sanitizing
-    base = "/tmp/uploads"
-    path = os.path.join(base, filename)
+    # Path traversal
+    path = os.path.join("/tmp/uploads", filename)
     with open(path, encoding="utf-8") as f:
         return f.read()
 
 
 def evaluate_expression(expr: str):
-    # Dangerous dynamic evaluation
+    # Dangerous eval
     return eval(expr)
 
 
@@ -69,29 +66,27 @@ class VulnerableHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         try:
-            if path == "/user":
-                username = params.get("name", ["guest"])[0]
-                body = str(lookup_user(username))
+            if path == "/health":
+                body = "ok"
+            elif path == "/user":
+                body = str(lookup_user(params.get("name", ["guest"])[0]))
             elif path == "/ping":
-                host = params.get("host", ["127.0.0.1"])[0]
-                body = run_ping(host)
+                body = run_ping(params.get("host", ["127.0.0.1"])[0])
             elif path == "/calc":
-                expr = params.get("expr", ["1+1"])[0]
-                body = str(evaluate_expression(expr))
+                body = str(evaluate_expression(params.get("expr", ["1+1"])[0]))
             elif path == "/file":
-                name = params.get("name", ["readme.txt"])[0]
-                body = read_user_file(name)
+                body = read_user_file(params.get("name", ["readme.txt"])[0])
             elif path == "/hash":
-                password = params.get("password", ["password"])[0]
-                body = weak_password_hash(password)
+                body = weak_password_hash(params.get("password", ["password"])[0])
             else:
                 body = (
                     "Vulnerable demo endpoints:\n"
-                    "  /user?name=alice\n"
-                    "  /ping?host=127.0.0.1\n"
-                    "  /calc?expr=1+1\n"
-                    "  /file?name=readme.txt\n"
-                    "  /hash?password=secret\n"
+                    "  GET /health\n"
+                    "  GET /user?name=alice\n"
+                    "  GET /ping?host=127.0.0.1\n"
+                    "  GET /calc?expr=1+1\n"
+                    "  GET /file?name=readme.txt\n"
+                    "  GET /hash?password=secret\n"
                 )
             status = 200
         except Exception as exc:  # noqa: BLE001 - demo only
@@ -102,7 +97,6 @@ class VulnerableHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        # Missing security headers on purpose (for DAST demos)
         self.end_headers()
         self.wfile.write(data)
 
@@ -111,7 +105,6 @@ class VulnerableHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    # Debug mode / bind all interfaces intentionally for the demo
     host, port = "0.0.0.0", 8080
     print(f"Starting vulnerable demo on http://{host}:{port}")
     print(f"Using DB password={DB_PASSWORD} api_key={API_KEY}")

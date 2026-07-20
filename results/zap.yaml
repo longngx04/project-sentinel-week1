@@ -3,7 +3,7 @@ env:
   - excludePaths: []
     name: baseline
     urls:
-    - http://127.0.0.1:3000
+    - http://juice-shop:3000
   parameters:
     failOnError: true
     progressToStdout: false
@@ -14,7 +14,7 @@ jobs:
   type: passiveScan-config
 - parameters:
     maxDuration: 1
-    url: http://127.0.0.1:3000
+    url: http://juice-shop:3000
   type: spider
 - parameters:
     maxDuration: 0
@@ -27,14 +27,14 @@ jobs:
 - parameters:
     reportDescription: ''
     reportDir: /zap/wrk/
-    reportFile: zap-juice.html
+    reportFile: zap.html
     reportTitle: ZAP Scanning Report
     template: traditional-html
   type: report
 - parameters:
     reportDescription: ''
     reportDir: /zap/wrk/
-    reportFile: zap-juice.json
+    reportFile: zap.json
     reportTitle: ZAP Scanning Report
     template: traditional-json
   type: report

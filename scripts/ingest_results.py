@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ingest scanner result JSON files into Postgres (scan_findings)."""
+"""Normalize Semgrep / Trivy / ZAP JSON reports into Postgres scan_findings."""
 
 from __future__ import annotations
 
@@ -76,17 +76,16 @@ def ingest_semgrep(data: dict, scan_id: str, cur) -> int:
     for r in data.get("results", []):
         extra = r.get("extra") or {}
         start = r.get("start") or {}
-        message = extra.get("message")
         insert_finding(
             cur,
             scan_id,
             "semgrep",
-            severity=extra.get("severity"),
+            severity=(extra.get("severity") or "UNKNOWN").upper(),
             rule_id=r.get("check_id"),
-            title=message,
+            title=r.get("check_id"),
             file_path=r.get("path"),
             line_start=start.get("line"),
-            description=message,
+            description=extra.get("message"),
             raw=r,
         )
         count += 1
@@ -95,9 +94,8 @@ def ingest_semgrep(data: dict, scan_id: str, cur) -> int:
 
 def ingest_trivy(data: dict, scan_id: str, cur) -> int:
     count = 0
-    for result in data.get("Results", []):
+    for result in data.get("Results") or []:
         target = result.get("Target")
-
         for vuln in result.get("Vulnerabilities") or []:
             insert_finding(
                 cur,
@@ -106,12 +104,26 @@ def ingest_trivy(data: dict, scan_id: str, cur) -> int:
                 severity=vuln.get("Severity"),
                 rule_id=vuln.get("VulnerabilityID"),
                 title=vuln.get("Title") or vuln.get("VulnerabilityID"),
-                file_path=vuln.get("PkgName") or target,
+                file_path=target,
+                line_start=None,
                 description=vuln.get("Description"),
                 raw=vuln,
             )
             count += 1
-
+        for mis in result.get("Misconfigurations") or []:
+            insert_finding(
+                cur,
+                scan_id,
+                "trivy",
+                severity=mis.get("Severity"),
+                rule_id=mis.get("ID"),
+                title=mis.get("Title"),
+                file_path=target,
+                line_start=None,
+                description=mis.get("Description") or mis.get("Message"),
+                raw=mis,
+            )
+            count += 1
         for secret in result.get("Secrets") or []:
             insert_finding(
                 cur,
@@ -122,128 +134,93 @@ def ingest_trivy(data: dict, scan_id: str, cur) -> int:
                 title=secret.get("Title"),
                 file_path=target,
                 line_start=secret.get("StartLine"),
-                description=secret.get("Category"),
+                description=secret.get("Match"),
                 raw=secret,
             )
             count += 1
-
-        for misconfig in result.get("Misconfigurations") or []:
-            cause = misconfig.get("CauseMetadata") or {}
-            insert_finding(
-                cur,
-                scan_id,
-                "trivy",
-                severity=misconfig.get("Severity"),
-                rule_id=misconfig.get("ID") or misconfig.get("AVDID"),
-                title=misconfig.get("Title"),
-                file_path=target,
-                line_start=cause.get("StartLine"),
-                description=misconfig.get("Description") or misconfig.get("Message"),
-                raw=misconfig,
-            )
-            count += 1
-
     return count
 
 
 def ingest_zap(data: dict, scan_id: str, cur) -> int:
     count = 0
-    for site in data.get("site", []):
-        for alert in site.get("alerts", []):
-            severity = ZAP_RISK.get(str(alert.get("riskcode")), alert.get("riskdesc"))
-            title = alert.get("name") or alert.get("alert")
-            rule_id = alert.get("alertRef") or alert.get("pluginid")
-            description = strip_html(alert.get("desc"))
-            instances = alert.get("instances") or [{}]
-
-            for inst in instances:
-                insert_finding(
-                    cur,
-                    scan_id,
-                    "zap",
-                    severity=severity,
-                    rule_id=rule_id,
-                    title=title,
-                    file_path=inst.get("uri"),
-                    description=description,
-                    raw={"alert": alert, "instance": inst},
-                )
-                count += 1
+    for site in data.get("site") or []:
+        for alert in site.get("alerts") or []:
+            riskcode = str(alert.get("riskcode", "0"))
+            insert_finding(
+                cur,
+                scan_id,
+                "zap",
+                severity=ZAP_RISK.get(riskcode, alert.get("riskdesc")),
+                rule_id=str(alert.get("pluginid") or alert.get("alertRef") or ""),
+                title=alert.get("alert") or alert.get("name"),
+                file_path=(alert.get("instances") or [{}])[0].get("uri"),
+                line_start=None,
+                description=strip_html(alert.get("desc")),
+                raw=alert,
+            )
+            count += 1
     return count
 
 
-def detect_tool(path: str, data: dict) -> str:
-    name = Path(path).name.lower()
-    if "semgrep" in name:
-        return "semgrep"
-    if "trivy" in name:
-        return "trivy"
-    if "zap" in name:
-        return "zap"
+def detect_and_ingest(path: Path, scan_id: str, cur) -> int:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    name = path.name.lower()
 
-    if "ArtifactName" in data or data.get("SchemaVersion") is not None:
-        return "trivy"
-    if isinstance(data.get("site"), list) or data.get("@programName") == "ZAP":
-        return "zap"
-    if isinstance(data.get("results"), list):
-        return "semgrep"
+    if "semgrep" in name or ("results" in data and "errors" in data):
+        return ingest_semgrep(data, scan_id, cur)
+    if "trivy" in name or "Results" in data:
+        return ingest_trivy(data, scan_id, cur)
+    if "zap" in name or "site" in data:
+        return ingest_zap(data, scan_id, cur)
 
-    raise ValueError(f"Cannot detect scanner tool for {path}")
+    # Fallback heuristics
+    if isinstance(data, dict) and "results" in data:
+        return ingest_semgrep(data, scan_id, cur)
+    raise ValueError(f"Unrecognized report format: {path}")
 
 
-INGESTERS = {
-    "semgrep": ingest_semgrep,
-    "trivy": ingest_trivy,
-    "zap": ingest_zap,
-}
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(
+            "Usage: ingest_results.py <report.json> [more.json ...]",
+            file=sys.stderr,
+        )
+        print(
+            "       ingest_results.py /results   # ingest all *.json in dir",
+            file=sys.stderr,
+        )
+        return 2
 
+    paths: list[Path] = []
+    for arg in argv[1:]:
+        p = Path(arg)
+        if p.is_dir():
+            paths.extend(sorted(p.glob("*.json")))
+        else:
+            paths.append(p)
 
-def default_paths() -> list[str]:
-    results_dir = Path("results")
-    candidates = [
-        results_dir / "semgrep.json",
-        results_dir / "trivy-juice.json",
-        results_dir / "zap-juice.json",
-    ]
-    return [str(p) for p in candidates if p.is_file()]
-
-
-def main() -> None:
-    paths = sys.argv[1:] or default_paths()
     if not paths:
-        print("No result files found. Pass JSON paths as arguments.", file=sys.stderr)
-        sys.exit(1)
+        print("No JSON reports found", file=sys.stderr)
+        return 1
 
     scan_id = str(uuid.uuid4())
     conn = psycopg2.connect(**DB)
-    cur = conn.cursor()
-
-    print(f"scan_id={scan_id}")
-    for path in paths:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        tool = detect_tool(path, data)
-        count = INGESTERS[tool](data, scan_id, cur)
-        print(f"{path}: ingested {count} {tool} finding(s)")
-
-    conn.commit()
-    cur.execute(
-        """
-        SELECT tool, severity, count(*)
-        FROM scan_findings
-        WHERE scan_id = %s
-        GROUP BY 1, 2
-        ORDER BY 1, 2
-        """,
-        (scan_id,),
-    )
-    print("Inserted. Summary:")
-    for row in cur.fetchall():
-        print(row)
-
-    cur.close()
-    conn.close()
+    total = 0
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for path in paths:
+                    if not path.is_file():
+                        print(f"Skip missing: {path}", file=sys.stderr)
+                        continue
+                    n = detect_and_ingest(path, scan_id, cur)
+                    print(f"{path.name}: ingested {n} findings")
+                    total += n
+        print(f"Done. scan_id={scan_id} total={total}")
+    finally:
+        conn.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv))

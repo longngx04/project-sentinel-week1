@@ -1,13 +1,30 @@
 services:
   juice-shop:
     image: bkimminich/juice-shop:latest
+    container_name: sentinel-juice-shop
     ports:
       - "3000:3000"
+    networks:
+      - sentinel
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  demo-app:
+    build:
+      context: ./demo_app
+    container_name: sentinel-demo-app
+    ports:
+      - "8080:8080"
     networks:
       - sentinel
 
   db:
     image: postgres:16-alpine
+    container_name: sentinel-db
     environment:
       POSTGRES_USER: sentinel
       POSTGRES_PASSWORD: sentinel
@@ -19,9 +36,35 @@ services:
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
       - sentinel
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d findings"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ingest:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: scripts/Dockerfile.ingest
+    container_name: sentinel-ingest
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: findings
+      DB_USER: sentinel
+      DB_PASSWORD: sentinel
+    volumes:
+      - ./results:/results:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - sentinel
 
 volumes:
   pgdata:
 
 networks:
   sentinel:
+    name: sentinel
